@@ -1,417 +1,726 @@
-#!/bin/sh
+#!/bin/bash
 
-# Adapted for Ubuntu 22.04 & 24.04
-# Source: https://kubernetes.io/docs/reference/setup-tools/kubeadm
-
-KUBE_VERSION=1.32.5
+################################################################################
+# Universal Kubernetes Master Node Installation Script
+# Supports: Ubuntu 20.04/22.04/24.04, Debian 11/12, CentOS 7/8/9, RHEL 8/9, Rocky Linux 8/9
+# Allows: Kubernetes version selection, Container runtime selection
+################################################################################
 
 set -e
 
-### verify Ubuntu version
-if [ -f /etc/lsb-release ]; then
-  . /etc/lsb-release
-else
-  echo "Cannot detect Ubuntu version (missing /etc/lsb-release)."
-  echo "Proceeding anyway in 5 seconds... (Ctrl+C to abort)"
-  sleep 5
-fi
+################################################################################
+# CONFIGURATION - MODIFY THESE AS NEEDED
+################################################################################
 
-if [ "${DISTRIB_ID}" != "Ubuntu" ]; then
-  echo "################################# "
-  echo "############ WARNING ############ "
-  echo "################################# "
-  echo
-  echo "This script is intended for Ubuntu 22.04 / 24.04!"
-  echo "You're using: ${DISTRIB_DESCRIPTION}"
-  echo "Better ABORT with Ctrl+C. Or press any key to continue the install"
-  read
-else
-  if [ "$DISTRIB_RELEASE" != "22.04" ] && [ "$DISTRIB_RELEASE" != "24.04" ]; then
-    echo "################################# "
-    echo "############ WARNING ############ "
-    echo "################################# "
-    echo
-    echo "This script is written for Ubuntu 22.04 / 24.04."
-    echo "You're using: ${DISTRIB_DESCRIPTION}"
-    echo "Better ABORT with Ctrl+C. Or press any key to continue the install"
-    read
-  fi
-fi
+# Kubernetes version (leave empty for latest stable)
+KUBE_VERSION="${KUBE_VERSION:-1.32.5}"
 
-### get platform
-PLATFORM=$(uname -p)
+# Container runtime: containerd, crio, or docker
+CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-containerd}"
 
-if [ "${PLATFORM}" = "aarch64" ]; then
-  PLATFORM="arm64"
-elif [ "${PLATFORM}" = "x86_64" ]; then
-  PLATFORM="amd64"
-else
-  echo "${PLATFORM} has to be either amd64 or arm64/aarch64. Check containerd supported binaries page"
-  echo "https://github.com/containerd/containerd/blob/main/docs/getting-started.md#option-1-from-the-official-binaries"
-  exit 1
-fi
+# CNI Plugin: weave, calico, flannel, or cilium
+CNI_PLUGIN="${CNI_PLUGIN:-weave}"
 
-### set hostname to the first part before the first dot
-short_hostname=$(hostname | cut -d. -f1)
-hostnamectl set-hostname "$short_hostname"
+# Pod network CIDR
+POD_NETWORK_CIDR="${POD_NETWORK_CIDR:-192.168.0.0/16}"
 
-### setup terminal
-apt-get --allow-unauthenticated update
-apt-get --allow-unauthenticated install -y bash-completion binutils
-echo 'colorscheme ron' >> ~/.vimrc
-echo 'set tabstop=2' >> ~/.vimrc
-echo 'set shiftwidth=2' >> ~/.vimrc
-echo 'set expandtab' >> ~/.vimrc
-echo 'source <(kubectl completion bash)' >> ~/.bashrc
-echo 'alias k=kubectl' >> ~/.bashrc
-echo 'alias c=clear' >> ~/.bashrc
-echo 'complete -F __start_kubectl k' >> ~/.bashrc
-sed -i '1s/^/force_color_prompt=yes\n/' ~/.bashrc
+################################################################################
+# COLORS AND FORMATTING
+################################################################################
 
-### disable linux swap and remove any existing swap partitions
-swapoff -a
-sed -i '/\sswap\s/ s/^\(.*\)$/#\1/g' /etc/fstab
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
 
-### remove packages
-kubeadm reset -f || true
-crictl rm --force $(crictl ps -a -q) || true
-apt-mark unhold kubelet kubeadm kubectl kubernetes-cni || true
-apt-get remove -y docker.io containerd kubelet kubeadm kubectl kubernetes-cni || true
-apt-get autoremove -y
-systemctl daemon-reload
+print_info() {
+    echo -e "${BLUE}[INFO]${NC} $1"
+}
 
-### install podman
-. /etc/os-release
-apt-get update
-apt-get -y install podman
+print_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1"
+}
 
-cat > /etc/containers/registries.conf <<EOF
-unqualified-search-registries = ["docker.io"]
+print_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+}
 
-[[registry]]
-prefix = "docker.io"
-location = "docker.io"
+print_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
 
-[[registry.mirror]]
-prefix = "docker.io"
-location = "mirror.gcr.io"
+print_header() {
+    echo ""
+    echo "=========================================="
+    echo "$1"
+    echo "=========================================="
+    echo ""
+}
 
-[[registry.mirror]]
-prefix = "docker.io"
-location = "registry-1.docker.io"
+################################################################################
+# DETECT LINUX DISTRIBUTION
+################################################################################
+
+detect_os() {
+    print_header "Detecting Operating System"
+    
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS=$ID
+        OS_VERSION=$VERSION_ID
+        OS_MAJOR_VERSION=$(echo $VERSION_ID | cut -d. -f1)
+    else
+        print_error "Cannot detect OS. /etc/os-release not found."
+        exit 1
+    fi
+    
+    print_info "Detected OS: $PRETTY_NAME"
+    print_info "OS ID: $OS"
+    print_info "Version: $OS_VERSION"
+    
+    case $OS in
+        ubuntu)
+            if [[ "$OS_VERSION" != "20.04" && "$OS_VERSION" != "22.04" && "$OS_VERSION" != "24.04" ]]; then
+                print_warning "Ubuntu $OS_VERSION is not officially tested. Recommended: 20.04, 22.04, or 24.04"
+                read -p "Continue anyway? (yes/no): " confirm
+                [[ "$confirm" != "yes" ]] && exit 1
+            fi
+            OS_FAMILY="debian"
+            ;;
+        debian)
+            if [[ "$OS_MAJOR_VERSION" != "11" && "$OS_MAJOR_VERSION" != "12" ]]; then
+                print_warning "Debian $OS_VERSION is not officially tested. Recommended: 11 or 12"
+                read -p "Continue anyway? (yes/no): " confirm
+                [[ "$confirm" != "yes" ]] && exit 1
+            fi
+            OS_FAMILY="debian"
+            ;;
+        centos|rhel|rocky|almalinux)
+            if [[ "$OS_MAJOR_VERSION" != "7" && "$OS_MAJOR_VERSION" != "8" && "$OS_MAJOR_VERSION" != "9" ]]; then
+                print_warning "$PRETTY_NAME is not officially tested. Recommended: 7, 8, or 9"
+                read -p "Continue anyway? (yes/no): " confirm
+                [[ "$confirm" != "yes" ]] && exit 1
+            fi
+            OS_FAMILY="rhel"
+            ;;
+        fedora)
+            OS_FAMILY="rhel"
+            print_warning "Fedora support is experimental"
+            ;;
+        *)
+            print_error "Unsupported OS: $OS"
+            print_info "Supported: Ubuntu, Debian, CentOS, RHEL, Rocky Linux, AlmaLinux"
+            exit 1
+            ;;
+    esac
+    
+    print_success "OS detection complete: $OS ($OS_FAMILY family)"
+}
+
+################################################################################
+# DETECT ARCHITECTURE
+################################################################################
+
+detect_architecture() {
+    print_header "Detecting System Architecture"
+    
+    ARCH=$(uname -m)
+    
+    case $ARCH in
+        x86_64)
+            PLATFORM="amd64"
+            ;;
+        aarch64|arm64)
+            PLATFORM="arm64"
+            ;;
+        armv7l)
+            PLATFORM="arm"
+            ;;
+        *)
+            print_error "Unsupported architecture: $ARCH"
+            exit 1
+            ;;
+    esac
+    
+    print_success "Architecture: $ARCH (Platform: $PLATFORM)"
+}
+
+################################################################################
+# SET HOSTNAME
+################################################################################
+
+set_hostname() {
+    print_header "Setting Hostname"
+    
+    short_hostname=$(hostname | cut -d. -f1)
+    hostnamectl set-hostname "$short_hostname" || true
+    
+    print_success "Hostname set to: $short_hostname"
+}
+
+################################################################################
+# SETUP TERMINAL ENVIRONMENT
+################################################################################
+
+setup_terminal() {
+    print_header "Setting Up Terminal Environment"
+    
+    # Install common utilities
+    if [ "$OS_FAMILY" = "debian" ]; then
+        apt-get update -qq
+        apt-get install -y vim bash-completion curl wget gnupg2 software-properties-common apt-transport-https ca-certificates
+    else
+        yum install -y vim bash-completion curl wget gnupg2 yum-utils
+    fi
+    
+    # VIM configuration
+    cat >> ~/.vimrc <<EOF
+colorscheme ron
+set tabstop=2
+set shiftwidth=2
+set expandtab
+syntax on
 EOF
+    
+    # Bash configuration
+    cat >> ~/.bashrc <<'EOF'
+# Kubernetes aliases
+alias k=kubectl
+alias c=clear
+source <(kubectl completion bash)
+complete -F __start_kubectl k
 
-### k8s apt repo
-apt-get update
-apt-get install -y apt-transport-https ca-certificates curl gpg
-mkdir -p /etc/apt/keyrings
+# Colorful prompt
+export PS1='\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '
+force_color_prompt=yes
+EOF
+    
+    print_success "Terminal environment configured"
+}
 
-rm /etc/apt/keyrings/kubernetes-1-32-apt-keyring.gpg || true
-rm /etc/apt/keyrings/kubernetes-1-31-apt-keyring.gpg || true
+################################################################################
+# DISABLE SWAP
+################################################################################
 
-curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.32/deb/Release.key \
-  | gpg --dearmor -o /etc/apt/keyrings/kubernetes-1-32-apt-keyring.gpg
+disable_swap() {
+    print_header "Disabling Swap"
+    
+    swapoff -a
+    sed -i '/\sswap\s/ s/^\(.*\)$/#\1/g' /etc/fstab
+    
+    print_success "Swap disabled"
+}
 
-curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key \
-  | gpg --dearmor -o /etc/apt/keyrings/kubernetes-1-31-apt-keyring.gpg
+################################################################################
+# CONFIGURE KERNEL MODULES AND SYSCTL
+################################################################################
 
-echo > /etc/apt/sources.list.d/kubernetes.list
-
-echo "deb [signed-by=/etc/apt/keyrings/kubernetes-1-32-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.32/deb/ /" \
-  | tee -a /etc/apt/sources.list.d/kubernetes.list
-
-echo "deb [signed-by=/etc/apt/keyrings/kubernetes-1-31-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /" \
-  | tee -a /etc/apt/sources.list.d/kubernetes.list
-
-apt-get --allow-unauthenticated update
-apt-get --allow-unauthenticated install -y \
-  containerd \
-  kubelet=${KUBE_VERSION}-1.1 \
-  kubeadm=${KUBE_VERSION}-1.1 \
-  kubectl=${KUBE_VERSION}-1.1 \
-  kubernetes-cni
-
-### configure containerd kernel bits
-cat <<EOF | tee /etc/modules-load.d/containerd.conf
+configure_kernel() {
+    print_header "Configuring Kernel Modules and sysctl"
+    
+    # Load kernel modules
+    cat <<EOF | tee /etc/modules-load.d/k8s.conf
 overlay
 br_netfilter
 EOF
-
-modprobe overlay
-modprobe br_netfilter
-
-cat <<EOF | tee /etc/sysctl.d/99-kubernetes-cri.conf
+    
+    modprobe overlay
+    modprobe br_netfilter
+    
+    # Configure sysctl
+    cat <<EOF | tee /etc/sysctl.d/k8s.conf
 net.bridge.bridge-nf-call-iptables  = 1
-net.ipv4.ip_forward                 = 1
 net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
 EOF
+    
+    sysctl --system > /dev/null 2>&1
+    
+    print_success "Kernel configured for Kubernetes"
+}
 
-sysctl --system
-mkdir -p /etc/containerd
+################################################################################
+# DISABLE SELINUX (RHEL-based systems)
+################################################################################
 
-### containerd config
-cat > /etc/containerd/config.toml <<EOF
-disabled_plugins = []
-imports = []
-oom_score = 0
-plugin_dir = ""
-required_plugins = []
-root = "/var/lib/containerd"
-state = "/run/containerd"
-version = 2
+disable_selinux() {
+    if [ "$OS_FAMILY" = "rhel" ]; then
+        print_header "Configuring SELinux"
+        
+        if [ -f /etc/selinux/config ]; then
+            setenforce 0 || true
+            sed -i 's/^SELINUX=enforcing$/SELINUX=permissive/' /etc/selinux/config
+            print_success "SELinux set to permissive mode"
+        fi
+    fi
+}
 
-[cgroup]
-  path = ""
+################################################################################
+# DISABLE FIREWALL (Optional - for learning environments)
+################################################################################
 
-[debug]
-  address = ""
-  format = ""
-  gid = 0
-  level = ""
-  uid = 0
+disable_firewall() {
+    print_header "Configuring Firewall"
+    
+    print_warning "Disabling firewall for learning environment"
+    print_warning "In production, configure firewall rules properly!"
+    
+    if [ "$OS_FAMILY" = "debian" ]; then
+        systemctl stop ufw 2>/dev/null || true
+        systemctl disable ufw 2>/dev/null || true
+        
+        # Disable AppArmor
+        systemctl stop apparmor 2>/dev/null || true
+        systemctl disable apparmor 2>/dev/null || true
+    else
+        systemctl stop firewalld 2>/dev/null || true
+        systemctl disable firewalld 2>/dev/null || true
+    fi
+    
+    print_success "Firewall disabled"
+}
 
-[grpc]
-  address = "/run/containerd/containerd.sock"
-  gid = 0
-  max_recv_message_size = 16777216
-  max_send_message_size = 16777216
-  tcp_address = ""
-  tcp_tls_cert = ""
-  tcp_tls_key = ""
-  uid = 0
+################################################################################
+# INSTALL CONTAINER RUNTIME - CONTAINERD
+################################################################################
 
-[metrics]
-  address = ""
-  grpc_histogram = false
-
-[plugins]
-
-  [plugins."io.containerd.gc.v1.scheduler"]
-    deletion_threshold = 0
-    mutation_threshold = 100
-    pause_threshold = 0.02
-    schedule_delay = "0s"
-    startup_delay = "100ms"
-
-  [plugins."io.containerd.grpc.v1.cri"]
-    disable_apparmor = false
-    disable_cgroup = false
-    disable_hugetlb_controller = true
-    disable_proc_mount = false
-    disable_tcp_service = true
-    enable_selinux = false
-    enable_tls_streaming = false
-    ignore_image_defined_volumes = false
-    max_concurrent_downloads = 3
-    max_container_log_line_size = 16384
-    netns_mounts_under_state_dir = false
-    restrict_oom_score_adj = false
-    sandbox_image = "k8s.gcr.io/pause:3.5"
-    selinux_category_range = 1024
-    stats_collect_period = 10
-    stream_idle_timeout = "4h0m0s"
-    stream_server_address = "127.0.0.1"
-    stream_server_port = "0"
-    systemd_cgroup = false
-    tolerate_missing_hugetlb_controller = true
-    unset_seccomp_profile = ""
-
-    [plugins."io.containerd.grpc.v1.cri".cni]
-      bin_dir = "/opt/cni/bin"
-      conf_dir = "/etc/cni/net.d"
-      conf_template = ""
-      max_conf_num = 1
-
-    [plugins."io.containerd.grpc.v1.cri".containerd]
-      default_runtime_name = "runc"
-      disable_snapshot_annotations = true
-      discard_unpacked_layers = false
-      no_pivot = false
-      snapshotter = "overlayfs"
-
-      [plugins."io.containerd.grpc.v1.cri".containerd.default_runtime]
-        base_runtime_spec = ""
-        container_annotations = []
-        pod_annotations = []
-        privileged_without_host_devices = false
-        runtime_engine = ""
-        runtime_root = ""
-        runtime_type = ""
-
-        [plugins."io.containerd.grpc.v1.cri".containerd.default_runtime.options]
-
-      [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
-
-        [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
-          base_runtime_spec = ""
-          container_annotations = []
-          pod_annotations = []
-          privileged_without_host_devices = false
-          runtime_engine = ""
-          runtime_root = ""
-          runtime_type = "io.containerd.runc.v2"
-
-          [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
-            BinaryName = ""
-            CriuImagePath = ""
-            CriuPath = ""
-            CriuWorkPath = ""
-            IoGid = 0
-            IoUid = 0
-            NoNewKeyring = false
-            NoPivotRoot = false
-            Root = ""
-            ShimCgroup = ""
-            SystemdCgroup = true
-
-      [plugins."io.containerd.grpc.v1.cri".containerd.untrusted_workload_runtime]
-        base_runtime_spec = ""
-        container_annotations = []
-        pod_annotations = []
-        privileged_without_host_devices = false
-        runtime_engine = ""
-        runtime_root = ""
-        runtime_type = ""
-
-        [plugins."io.containerd.grpc.v1.cri".containerd.untrusted_workload_runtime.options]
-
-    [plugins."io.containerd.grpc.v1.cri".image_decryption]
-      key_model = "node"
-
-    [plugins."io.containerd.grpc.v1.cri".registry]
-      config_path = ""
-
-      [plugins."io.containerd.grpc.v1.cri".registry.auths]
-
-      [plugins."io.containerd.grpc.v1.cri".registry.configs]
-        [plugins."io.containerd.grpc.v1.cri".registry.configs."registry.killer.sh:5000".tls]
-          insecure_skip_verify = true
-
-      [plugins."io.containerd.grpc.v1.cri".registry.headers]
-
-      [plugins."io.containerd.grpc.v1.cri".registry.mirrors]
-        [plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
-          endpoint = ["https://mirror.gcr.io", "https://registry-1.docker.io"]
-
-    [plugins."io.containerd.grpc.v1.cri".x509_key_pair_streaming]
-      tls_cert_file = ""
-      tls_key_file = ""
-
-  [plugins."io.containerd.internal.v1.opt"]
-    path = "/opt/containerd"
-
-  [plugins."io.containerd.internal.v1.restart"]
-    interval = "10s"
-
-  [plugins."io.containerd.metadata.v1.bolt"]
-    content_sharing_policy = "shared"
-
-  [plugins."io.containerd.monitor.v1.cgroups"]
-    no_prometheus = false
-
-  [plugins."io.containerd.runtime.v1.linux"]
-    no_shim = false
-    runtime = "runc"
-    runtime_root = ""
-    shim = "containerd-shim"
-    shim_debug = false
-
-  [plugins."io.containerd.runtime.v2.task"]
-    platforms = ["linux/amd64"]
-
-  [plugins."io.containerd.service.v1.diff-service"]
-    default = ["walking"]
-
-  [plugins."io.containerd.snapshotter.v1.aufs"]
-    root_path = ""
-
-  [plugins."io.containerd.snapshotter.v1.btrfs"]
-    root_path = ""
-
-  [plugins."io.containerd.snapshotter.v1.devmapper"]
-    async_remove = false
-    base_image_size = ""
-    pool_name = ""
-    root_path = ""
-
-  [plugins."io.containerd.snapshotter.v1.native"]
-    root_path = ""
-
-  [plugins."io.containerd.snapshotter.v1.overlayfs"]
-    root_path = ""
-
-  [plugins."io.containerd.snapshotter.v1.zfs"]
-    root_path = ""
-
-[proxy_plugins]
-
-[stream_processors]
-
-  [stream_processors."io.containerd.ocicrypt.decoder.v1.tar"]
-    accepts = ["application/vnd.oci.image.layer.v1.tar+encrypted"]
-    args = ["--decryption-keys-path", "/etc/containerd/ocicrypt/keys"]
-    env = ["OCICRYPT_KEYPROVIDER_CONFIG=/etc/containerd/ocicrypt/ocicrypt_keyprovider.conf"]
-    path = "ctd-decoder"
-    returns = "application/vnd.oci.image.layer.v1.tar"
-
-  [stream_processors."io.containerd.ocicrypt.decoder.v1.tar.gzip"]
-    accepts = ["application/vnd.oci.image.layer.v1.tar+gzip+encrypted"]
-    args = ["--decryption-keys-path", "/etc/containerd/ocicrypt/keys"]
-    env = ["OCICRYPT_KEYPROVIDER_CONFIG=/etc/containerd/ocicrypt/ocicrypt_keyprovider.conf"]
-    path = "ctd-decoder"
-    returns = "application/vnd.oci.image.layer.v1.tar+gzip"
-
-[timeouts]
-  "io.containerd.timeout.shim.cleanup" = "5s"
-  "io.containerd.timeout.shim.load" = "5s"
-  "io.containerd.timeout.shim.shutdown" = "3s"
-  "io.containerd.timeout.task.state" = "2s"
-
-[ttrpc]
-  address = ""
-  gid = 0
-  uid = 0
-EOF
-
-### crictl uses containerd as default
-cat <<EOF | tee /etc/crictl.yaml
+install_containerd() {
+    print_header "Installing containerd"
+    
+    if [ "$OS_FAMILY" = "debian" ]; then
+        # Install containerd from Docker repository
+        curl -fsSL https://download.docker.com/linux/$OS/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+        
+        echo "deb [arch=$PLATFORM signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/$OS $(lsb_release -cs) stable" | \
+            tee /etc/apt/sources.list.d/docker.list > /dev/null
+        
+        apt-get update -qq
+        apt-get install -y containerd.io
+    else
+        # RHEL-based systems
+        yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+        yum install -y containerd.io
+    fi
+    
+    # Configure containerd
+    mkdir -p /etc/containerd
+    containerd config default | tee /etc/containerd/config.toml > /dev/null
+    
+    # Enable SystemdCgroup
+    sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+    
+    # Configure registry mirrors
+    sed -i '/\[plugins."io.containerd.grpc.v1.cri".registry.mirrors\]/a\        [plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]\n          endpoint = ["https://mirror.gcr.io", "https://registry-1.docker.io"]' /etc/containerd/config.toml
+    
+    # Configure crictl
+    cat <<EOF | tee /etc/crictl.yaml
 runtime-endpoint: unix:///run/containerd/containerd.sock
+image-endpoint: unix:///run/containerd/containerd.sock
+timeout: 10
 EOF
+    
+    systemctl daemon-reload
+    systemctl enable containerd
+    systemctl restart containerd
+    
+    print_success "containerd installed and configured"
+}
 
-### disable apparmor (as in original script)
-aa-teardown > /dev/null 2>&1 || true
-service apparmor stop > /dev/null 2>&1 || true
-systemctl disable apparmor > /dev/null 2>&1 || true
-apt-get remove -y apparmor > /dev/null 2>&1 || true
+################################################################################
+# INSTALL CONTAINER RUNTIME - CRI-O
+################################################################################
 
-### start services
-systemctl daemon-reload
-systemctl enable containerd
-systemctl restart containerd
-systemctl enable kubelet && systemctl start kubelet
+install_crio() {
+    print_header "Installing CRI-O"
+    
+    CRIO_VERSION=$(echo $KUBE_VERSION | cut -d. -f1,2)
+    
+    if [ "$OS_FAMILY" = "debian" ]; then
+        curl -fsSL https://pkgs.k8s.io/addons:/cri-o:/stable:/v${CRIO_VERSION}/deb/Release.key | \
+            gpg --dearmor -o /usr/share/keyrings/cri-o-apt-keyring.gpg
+        
+        echo "deb [signed-by=/usr/share/keyrings/cri-o-apt-keyring.gpg] https://pkgs.k8s.io/addons:/cri-o:/stable:/v${CRIO_VERSION}/deb/ /" | \
+            tee /etc/apt/sources.list.d/cri-o.list
+        
+        apt-get update -qq
+        apt-get install -y cri-o
+    else
+        curl -L -o /etc/yum.repos.d/cri-o.repo https://pkgs.k8s.io/addons:/cri-o:/stable:/v${CRIO_VERSION}/rpm/cri-o.repo
+        yum install -y cri-o
+    fi
+    
+    systemctl daemon-reload
+    systemctl enable crio
+    systemctl start crio
+    
+    print_success "CRI-O installed and configured"
+}
 
-### init k8s
-rm /root/.kube/config || true
-kubeadm init \
-  --kubernetes-version=${KUBE_VERSION} \
-  --ignore-preflight-errors=NumCPU \
-  --skip-token-print \
-  --pod-network-cidr 192.168.0.0/16
+################################################################################
+# INSTALL CONTAINER RUNTIME - DOCKER (Legacy)
+################################################################################
 
-mkdir -p ~/.kube
-cp -i /etc/kubernetes/admin.conf ~/.kube/config
-chown "$(id -u):$(id -g)" ~/.kube/config
+install_docker() {
+    print_header "Installing Docker (Legacy)"
+    
+    print_warning "Docker as container runtime is deprecated in Kubernetes"
+    print_warning "Consider using containerd or CRI-O instead"
+    
+    if [ "$OS_FAMILY" = "debian" ]; then
+        curl -fsSL https://download.docker.com/linux/$OS/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+        
+        echo "deb [arch=$PLATFORM signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/$OS $(lsb_release -cs) stable" | \
+            tee /etc/apt/sources.list.d/docker.list > /dev/null
+        
+        apt-get update -qq
+        apt-get install -y docker-ce docker-ce-cli
+    else
+        yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+        yum install -y docker-ce docker-ce-cli
+    fi
+    
+    # Configure Docker daemon
+    mkdir -p /etc/docker
+    cat <<EOF | tee /etc/docker/daemon.json
+{
+  "exec-opts": ["native.cgroupdriver=systemd"],
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "100m"
+  },
+  "storage-driver": "overlay2"
+}
+EOF
+    
+    systemctl daemon-reload
+    systemctl enable docker
+    systemctl restart docker
+    
+    # Install cri-dockerd (required for k8s 1.24+)
+    install_cri_dockerd
+    
+    print_success "Docker installed and configured"
+}
 
-### CNI (weave)
-kubectl apply -f https://raw.githubusercontent.com/killer-sh/cks-course-environment/master/cluster-setup/weave.yaml
-echo "Waiting for weave-net to be ready..."
-sleep 10
-kubectl -n kube-system wait --for=condition=Ready pod -l name=weave-net --timeout=3600s
-sleep 5
-kubectl -n kube-system delete pods -l k8s-app=kube-dns --force --grace-period 0
-echo "Waiting for weave-net to be ready... done"
+################################################################################
+# INSTALL CRI-DOCKERD (for Docker runtime with k8s 1.24+)
+################################################################################
 
-### finished
-echo
-echo "### COMMAND TO ADD A WORKER NODE ###"
-kubeadm token create --print-join-command --ttl 0
+install_cri_dockerd() {
+    print_info "Installing cri-dockerd..."
+    
+    CRI_DOCKERD_VERSION="0.3.9"
+    
+    if [ ! -f /usr/local/bin/cri-dockerd ]; then
+        cd /tmp
+        wget https://github.com/Mirantis/cri-dockerd/releases/download/v${CRI_DOCKERD_VERSION}/cri-dockerd-${CRI_DOCKERD_VERSION}.${PLATFORM}.tgz
+        tar -xzf cri-dockerd-${CRI_DOCKERD_VERSION}.${PLATFORM}.tgz
+        mv cri-dockerd/cri-dockerd /usr/local/bin/
+        
+        # Install systemd units
+        wget -O /etc/systemd/system/cri-docker.service https://raw.githubusercontent.com/Mirantis/cri-dockerd/master/packaging/systemd/cri-docker.service
+        wget -O /etc/systemd/system/cri-docker.socket https://raw.githubusercontent.com/Mirantis/cri-dockerd/master/packaging/systemd/cri-docker.socket
+        
+        sed -i 's|/usr/bin/cri-dockerd|/usr/local/bin/cri-dockerd|g' /etc/systemd/system/cri-docker.service
+        
+        systemctl daemon-reload
+        systemctl enable cri-docker.service
+        systemctl enable cri-docker.socket
+        systemctl start cri-docker.service
+        systemctl start cri-docker.socket
+        
+        print_success "cri-dockerd installed"
+    fi
+}
+
+################################################################################
+# INSTALL KUBERNETES PACKAGES
+################################################################################
+
+install_kubernetes() {
+    print_header "Installing Kubernetes v${KUBE_VERSION}"
+    
+    KUBE_MAJOR_VERSION=$(echo $KUBE_VERSION | cut -d. -f1,2)
+    
+    if [ "$OS_FAMILY" = "debian" ]; then
+        # Add Kubernetes repository
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v${KUBE_MAJOR_VERSION}/deb/Release.key | \
+            gpg --dearmor -o /usr/share/keyrings/kubernetes-apt-keyring.gpg
+        
+        echo "deb [signed-by=/usr/share/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v${KUBE_MAJOR_VERSION}/deb/ /" | \
+            tee /etc/apt/sources.list.d/kubernetes.list
+        
+        apt-get update -qq
+        
+        # Install specific version or latest
+        if [ -n "$KUBE_VERSION" ]; then
+            apt-get install -y kubelet=${KUBE_VERSION}-* kubeadm=${KUBE_VERSION}-* kubectl=${KUBE_VERSION}-*
+        else
+            apt-get install -y kubelet kubeadm kubectl
+        fi
+        
+        apt-mark hold kubelet kubeadm kubectl
+    else
+        # RHEL-based systems
+        cat <<EOF | tee /etc/yum.repos.d/kubernetes.repo
+[kubernetes]
+name=Kubernetes
+baseurl=https://pkgs.k8s.io/core:/stable:/v${KUBE_MAJOR_VERSION}/rpm/
+enabled=1
+gpgcheck=1
+gpgkey=https://pkgs.k8s.io/core:/stable:/v${KUBE_MAJOR_VERSION}/rpm/repodata/repomd.xml.key
+exclude=kubelet kubeadm kubectl cri-tools kubernetes-cni
+EOF
+        
+        if [ -n "$KUBE_VERSION" ]; then
+            yum install -y kubelet-${KUBE_VERSION} kubeadm-${KUBE_VERSION} kubectl-${KUBE_VERSION} --disableexcludes=kubernetes
+        else
+            yum install -y kubelet kubeadm kubectl --disableexcludes=kubernetes
+        fi
+    fi
+    
+    systemctl enable kubelet
+    
+    print_success "Kubernetes packages installed"
+}
+
+################################################################################
+# INITIALIZE KUBERNETES CLUSTER
+################################################################################
+
+initialize_cluster() {
+    print_header "Initializing Kubernetes Cluster"
+    
+    # Prepare kubeadm config
+    KUBEADM_CONFIG=""
+    
+    if [ "$CONTAINER_RUNTIME" = "docker" ]; then
+        KUBEADM_CONFIG="--cri-socket unix:///var/run/cri-dockerd.sock"
+    elif [ "$CONTAINER_RUNTIME" = "crio" ]; then
+        KUBEADM_CONFIG="--cri-socket unix:///var/run/crio/crio.sock"
+    fi
+    
+    # Initialize cluster
+    kubeadm init \
+        --kubernetes-version=${KUBE_VERSION} \
+        --pod-network-cidr=${POD_NETWORK_CIDR} \
+        --ignore-preflight-errors=NumCPU \
+        --skip-token-print \
+        $KUBEADM_CONFIG
+    
+    # Setup kubeconfig for root
+    mkdir -p ~/.kube
+    cp -f /etc/kubernetes/admin.conf ~/.kube/config
+    chown $(id -u):$(id -g) ~/.kube/config
+    
+    # Also set KUBECONFIG environment variable
+    export KUBECONFIG=~/.kube/config
+    echo "export KUBECONFIG=~/.kube/config" >> ~/.bashrc
+    
+    print_success "Kubernetes cluster initialized"
+}
+
+################################################################################
+# INSTALL CNI PLUGIN - WEAVE
+################################################################################
+
+install_weave() {
+    print_header "Installing Weave Net CNI"
+    
+    kubectl apply -f https://github.com/weaveworks/weave/releases/download/v2.8.1/weave-daemonset-k8s.yaml
+    
+    print_info "Waiting for Weave Net to be ready..."
+    kubectl -n kube-system wait --for=condition=Ready pod -l name=weave-net --timeout=300s || true
+    
+    print_success "Weave Net installed"
+}
+
+################################################################################
+# INSTALL CNI PLUGIN - CALICO
+################################################################################
+
+install_calico() {
+    print_header "Installing Calico CNI"
+    
+    kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/tigera-operator.yaml
+    kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/custom-resources.yaml
+    
+    print_info "Waiting for Calico to be ready..."
+    kubectl -n calico-system wait --for=condition=Ready pod --all --timeout=300s || true
+    
+    print_success "Calico installed"
+}
+
+################################################################################
+# INSTALL CNI PLUGIN - FLANNEL
+################################################################################
+
+install_flannel() {
+    print_header "Installing Flannel CNI"
+    
+    kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+    
+    print_info "Waiting for Flannel to be ready..."
+    kubectl -n kube-flannel wait --for=condition=Ready pod -l app=flannel --timeout=300s || true
+    
+    print_success "Flannel installed"
+}
+
+################################################################################
+# INSTALL CNI PLUGIN - CILIUM
+################################################################################
+
+install_cilium() {
+    print_header "Installing Cilium CNI"
+    
+    CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)
+    
+    if [ ! -f /usr/local/bin/cilium ]; then
+        curl -L --fail --remote-name-all https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-${PLATFORM}.tar.gz
+        tar xzvf cilium-linux-${PLATFORM}.tar.gz -C /usr/local/bin
+        rm cilium-linux-${PLATFORM}.tar.gz
+    fi
+    
+    cilium install
+    
+    print_success "Cilium installed"
+}
+
+################################################################################
+# GENERATE JOIN COMMAND
+################################################################################
+
+generate_join_command() {
+    print_header "Generating Worker Join Command"
+    
+    echo ""
+    echo "=========================================="
+    echo "MASTER NODE SETUP COMPLETE!"
+    echo "=========================================="
+    echo ""
+    echo "To add worker nodes to this cluster, run the following command on each worker:"
+    echo ""
+    kubeadm token create --print-join-command --ttl 0
+    echo ""
+    
+    if [ "$CONTAINER_RUNTIME" = "docker" ]; then
+        echo "NOTE: Add '--cri-socket unix:///var/run/cri-dockerd.sock' to the join command when using Docker runtime"
+    elif [ "$CONTAINER_RUNTIME" = "crio" ]; then
+        echo "NOTE: Add '--cri-socket unix:///var/run/crio/crio.sock' to the join command when using CRI-O runtime"
+    fi
+    
+    echo ""
+}
+
+################################################################################
+# PRINT CLUSTER INFO
+################################################################################
+
+print_cluster_info() {
+    print_header "Cluster Information"
+    
+    echo "Kubernetes Version: $(kubectl version --short 2>/dev/null | grep Server | awk '{print $3}')"
+    echo "Container Runtime: $CONTAINER_RUNTIME"
+    echo "CNI Plugin: $CNI_PLUGIN"
+    echo "Pod Network CIDR: $POD_NETWORK_CIDR"
+    echo ""
+    echo "Nodes:"
+    kubectl get nodes
+    echo ""
+    echo "System Pods:"
+    kubectl get pods -n kube-system
+    echo ""
+}
+
+################################################################################
+# MAIN INSTALLATION FLOW
+################################################################################
+
+main() {
+    print_header "Kubernetes Master Node Installation"
+    print_info "Configuration:"
+    print_info "  Kubernetes Version: ${KUBE_VERSION}"
+    print_info "  Container Runtime: ${CONTAINER_RUNTIME}"
+    print_info "  CNI Plugin: ${CNI_PLUGIN}"
+    print_info "  Pod Network CIDR: ${POD_NETWORK_CIDR}"
+    echo ""
+    
+    read -p "Proceed with installation? (yes/no): " confirm
+    if [ "$confirm" != "yes" ]; then
+        print_error "Installation cancelled"
+        exit 0
+    fi
+    
+    # Check if running as root
+    if [ "$EUID" -ne 0 ]; then
+        print_error "This script must be run as root"
+        exit 1
+    fi
+    
+    # Installation steps
+    detect_os
+    detect_architecture
+    set_hostname
+    setup_terminal
+    disable_swap
+    configure_kernel
+    disable_selinux
+    disable_firewall
+    
+    # Install container runtime
+    case $CONTAINER_RUNTIME in
+        containerd)
+            install_containerd
+            ;;
+        crio)
+            install_crio
+            ;;
+        docker)
+            install_docker
+            ;;
+        *)
+            print_error "Unsupported container runtime: $CONTAINER_RUNTIME"
+            exit 1
+            ;;
+    esac
+    
+    install_kubernetes
+    initialize_cluster
+    
+    # Install CNI plugin
+    case $CNI_PLUGIN in
+        weave)
+            install_weave
+            ;;
+        calico)
+            install_calico
+            ;;
+        flannel)
+            install_flannel
+            ;;
+        cilium)
+            install_cilium
+            ;;
+        *)
+            print_error "Unsupported CNI plugin: $CNI_PLUGIN"
+            exit 1
+            ;;
+    esac
+    
+    # Restart CoreDNS
+    kubectl -n kube-system rollout restart deployment coredns
+    
+    # Wait for all pods to be ready
+    print_info "Waiting for all system pods to be ready..."
+    sleep 10
+    
+    generate_join_command
+    print_cluster_info
+    
+    print_success "Master node installation complete!"
+    print_info "Re-login to apply bash configuration changes"
+}
+
+# Run main function
+main "$@"
