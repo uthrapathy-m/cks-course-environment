@@ -21,7 +21,11 @@ bash <(curl -s https://raw.githubusercontent.com/uthrapathy-m/cks-course-environ
 
 ## Install your worker key on control-plane using an existing working login
 
-### 1) On worker: show your public key
+### 1) On worker: Create and show your public key
+
+```bash
+ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N ""
+```
 
 ```bash
 cat /root/.ssh/id_ed25519.pub
